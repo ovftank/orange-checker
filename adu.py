@@ -17,7 +17,7 @@ from playwright_stealth import Stealth
 from python_ghost_cursor.playwright_sync import install_mouse_helper
 from torch import Tensor, nn
 from torchvision import models, transforms
-
+from multiprocessing import Pool, cpu_count
 
 class OrangeChecker:
     def __init__(self, headless: bool = False, email: str = "") -> None:
@@ -35,6 +35,7 @@ class OrangeChecker:
         self.stealth = Stealth()
         self.image_cache: dict[int, str] = {}
         self._model_lock = Lock()
+        self.response_data =None
 
     def __enter__(self):
         self.playwright = sync_playwright().start()
@@ -542,6 +543,7 @@ class OrangeChecker:
             print(f"captcha detected: {current_url}")
             self.page.wait_for_selector("#image-grid", timeout=10000)
             solved = self._solve_captcha()
+            check_mobile_connect= False
             if solved:
                 if self._click_continue_button():
                     try:
@@ -552,30 +554,51 @@ class OrangeChecker:
                     except Exception as e:
                         print(f"wait for login page timeout: {e}")
                     api_response = self._fill_email_and_submit()
+                        
                     if api_response:
+                        if api_response["data"]["mobileConnectScreen"]["displayedAccount"]["isMobileConnect"] :
+                            check_mobile_connect = True
                         print(f"captured api response: {api_response}")
 
+        
+        if check_mobile_connect:
+            save_mail =  self.email.strip()
+            with open("mail_is_mobile.txt","a", encoding="utf-8") as f:
+                f.write(self.email.strip() + "\r\n")
         title = self.page.title()
         print(f"page title: {title}")
         print(f"current url: {current_url}")
 
-        return {"title": title, "url": current_url, "is_captcha": is_captcha}
+        return {"title": title, "url": current_url, "is_captcha": is_captcha,"is_mobile_connect":check_mobile_connect}
 
     def run(self) -> dict[str, str | bool]:
         self.setup_browser()
         return self.check_page()
 
+    
 
-def main() -> None:
+
+
+
+def check_mail(mail):
     try:
-        with OrangeChecker(headless=False, email="conga@orange.fr") as checker:
+        with OrangeChecker(headless=False, email=mail.strip()) as checker:
             result = checker.run()
-            print(f"check result: {result}")
-            input()
-
+            print(f"{mail} -> {result}")
+            return result
     except Exception as e:
-        print(f"error: {e}")
+        print(f"{mail} -> error: {e}")
+        return None
 
+def main():
+    with open("html.txt") as f:
+        mails = [m.strip() for m in f.readlines()]
+
+
+    workers = 6
+
+    with Pool(workers) as pool:
+        pool.map(check_mail, mails)
 
 if __name__ == "__main__":
     main()
