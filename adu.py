@@ -6,60 +6,46 @@ from urllib.parse import parse_qs, urlparse
 
 import torch
 from PIL import Image
-from playwright.sync_api import (
+from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     Playwright,
-    sync_playwright,
+    async_playwright,
+    
 )
-from playwright_stealth import Stealth
-from python_ghost_cursor.playwright_sync import install_mouse_helper
+# from playwright_stealth import Stealth
+from python_ghost_cursor.playwright_async import install_mouse_helper
 from torch import Tensor, nn
 from torchvision import models, transforms
 from multiprocessing import Pool, cpu_count
+from playwright_stealth import Stealth
+import asyncio
+
+
 
 class OrangeChecker:
-    def __init__(self, headless: bool = False, email: str = "") -> None:
+    def __init__(self, headless: bool = False, email: str = "",context=None) -> None:
         self.headless = headless
         self.model_path = "model.pth"
         self.email = email
-        self.playwright: Playwright | None = None
-        self.browser: Browser | None = None
-        self.context: BrowserContext | None = None
+        self.context: BrowserContext | None = context
         self.page: Page | None = None
         self.model = None
         self.class_names = None
         self.transform_config = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.stealth = Stealth()
         self.image_cache: dict[int, str] = {}
         self._model_lock = Lock()
         self.response_data =None
 
-    def __enter__(self):
-        self.playwright = sync_playwright().start()
-        return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
+    async def setup_context(self) -> None:
+        
 
-    def setup_browser(self) -> None:
-        if not self.playwright:
-            print("chua bat playwright")
-            return
-        self.browser = self.playwright.chromium.launch(headless=self.headless)
+        self.page =  await self.context.new_page()
 
-        self.context = self.browser.new_context()
-
-        self.stealth.apply_stealth_sync(self.context)
-
-        self.page = self.context.new_page()
-
-        install_mouse_helper(self.page)
+        await install_mouse_helper(self.page)
 
         cookie_click_script = """
         (() => {
@@ -115,7 +101,7 @@ class OrangeChecker:
             }
         })();
         """
-        self.context.add_init_script(script=cookie_click_script)
+        await self.context.add_init_script(script=cookie_click_script)
 
         self.context.set_default_timeout(60000)
         self.context.set_default_navigation_timeout(60000)
@@ -189,14 +175,14 @@ class OrangeChecker:
         confidence = top_prob.item()
         return class_name, confidence
 
-    def _get_captcha_requirement(self) -> str | None:
+    async def _get_captcha_requirement(self) -> str | None:
         if not self.page:
             return None
 
         try:
-            timeline_element = self.page.locator(".ob1-timeline-step.active")
-            timeline_element.wait_for(state="attached", timeout=5000)
-            title_element = timeline_element.locator(".ob1-timeline-title")
+            timeline_element = await self.page.locator(".ob1-timeline-step.active")
+            await timeline_element.wait_for(state="attached", timeout=5000)
+            title_element = await timeline_element.locator(".ob1-timeline-title")
             if title_element.count() > 0:
                 content = title_element.first.text_content()
                 if content:
@@ -209,21 +195,21 @@ class OrangeChecker:
             pass
         return None
 
-    def _has_active_step(self) -> bool:
+    async def _has_active_step(self) -> bool:
         if not self.page:
             return False
 
         try:
             active_steps = self.page.locator(".ob1-timeline-step.active")
-            return active_steps.count() > 0
+            return await active_steps.count() > 0
         except Exception:
             return False
 
-    def _get_captcha_images(self) -> list[dict]:
+    async def _get_captcha_images(self) -> list[dict]:
         if not self.page:
             return []
 
-        buttons = self.page.locator(".captcha_btn__1Pngd").all()
+        buttons = await self.page.locator(".captcha_btn__1Pngd").all()
         image_data = []
 
         for idx, button in enumerate(buttons):
@@ -257,11 +243,11 @@ class OrangeChecker:
             print(f"error processing image {index}: {e}")
             return None
 
-    def _predict_and_cache_images(self, image_data: list[dict]) -> None:
+    async def _predict_and_cache_images(self, image_data: list[dict]) -> None:
         if not self.page:
             return
 
-        self._load_model()
+        await self._load_model()
 
         items_to_process = [
             item for item in image_data if item["index"] not in self.image_cache
@@ -276,7 +262,7 @@ class OrangeChecker:
         try:
             for item in items_to_process:
                 try:
-                    image_path = self._screenshot_element(item["button"])
+                    image_path = await self._screenshot_element(item["button"])
                     image_paths[item["index"]] = image_path
                     temp_files.append(image_path)
                 except Exception as e:
@@ -306,18 +292,18 @@ class OrangeChecker:
                 except Exception:
                     pass
 
-    def _solve_captcha_step(self, use_cache: bool = False) -> int:
+    async def _solve_captcha_step(self, use_cache: bool = False) -> int:
         if not self.page:
             return False
 
-        requirement = self._get_captcha_requirement()
+        requirement = await self._get_captcha_requirement()
         if not requirement:
             print("không tìm thấy yêu cầu captcha")
             return False
 
         print(f"captcha requirement: {requirement}")
 
-        image_data = self._get_captcha_images()
+        image_data = await self._get_captcha_images()
         if not image_data:
             print("không tìm thấy images captcha")
             return False
@@ -360,7 +346,7 @@ class OrangeChecker:
             print(f"không tìm thấy reload button: {e}")
             return False
 
-    def _solve_captcha(self) -> bool:
+    async def _solve_captcha(self) -> bool:
         if not self.page:
             return False
 
@@ -379,7 +365,7 @@ class OrangeChecker:
             clicked_count = 0
 
             while reload_count < max_reloads:
-                clicked_count = self._solve_captcha_step(use_cache=use_cache)
+                clicked_count = await self._solve_captcha_step(use_cache=use_cache)
 
                 if clicked_count > 0:
                     break
@@ -409,14 +395,14 @@ class OrangeChecker:
 
         return True
 
-    def _click_continue_button(self) -> bool:
+    async def _click_continue_button(self) -> bool:
         if not self.page:
             return False
 
         try:
             continue_button = self.page.get_by_role("button", name="Continuer")
-            continue_button.wait_for(state="visible", timeout=5000)
-            continue_button.click()
+            await continue_button.wait_for(state="visible", timeout=5000)
+            await continue_button.click()
             print("clicked continue button")
             return True
         except Exception as e:
@@ -469,7 +455,7 @@ class OrangeChecker:
         """
         self.page.evaluate(accept_script)
 
-    def _fill_email_and_submit(self) -> dict | None:
+    async def _fill_email_and_submit(self) -> dict | None:
         if not self.page:
             print("page not initialized")
             return None
@@ -479,14 +465,14 @@ class OrangeChecker:
             return None
 
         try:
-            self.page.wait_for_selector("#login", timeout=10000)
+            await self.page.wait_for_selector("#login", timeout=10000)
             email_input = self.page.locator("#login")
-            email_input.wait_for(state="visible", timeout=10000)
-            email_input.fill(self.email)
+            await email_input.wait_for(state="visible", timeout=10000)
+            await email_input.fill(self.email)
             print(f"filled email: {self.email}")
 
             submit_button = self.page.locator("#btnSubmit")
-            submit_button.wait_for(state="visible", timeout=5000)
+            await submit_button.wait_for(state="visible", timeout=5000)
 
             try:
                 with self.page.expect_response(
@@ -513,7 +499,7 @@ class OrangeChecker:
                     return {"text": response_text, "status": response.status}
             except Exception as e:
                 print(f"no api response captured: {e}")
-                submit_button.click()
+                await submit_button.click()
                 print("clicked submit button")
                 return None
 
@@ -521,14 +507,14 @@ class OrangeChecker:
             print(f"error filling email: {e}")
             return None
 
-    def check_page(self) -> dict[str, str | bool]:
+    async def check_page(self) -> dict[str, str | bool]:
         if not self.page:
             raise RuntimeError("page chưa được setup, gọi setup_browser() trước")
 
-        self.page.goto("https://login.orange.fr", wait_until="load")
+        await self.page.goto("https://login.orange.fr", wait_until="load")
 
         try:
-            self.page.wait_for_url(
+            await self.page.wait_for_url(
                 self._is_captcha_url, timeout=5000, wait_until="networkidle"
             )
             is_captcha = True
@@ -542,18 +528,18 @@ class OrangeChecker:
         if is_captcha:
             print(f"captcha detected: {current_url}")
             self.page.wait_for_selector("#image-grid", timeout=10000)
-            solved = self._solve_captcha()
+            solved = await self._solve_captcha()
             check_mobile_connect= False
             if solved:
                 if self._click_continue_button():
                     try:
-                        self.page.wait_for_selector("#login", timeout=10000)
+                        await self.page.wait_for_selector("#login", timeout=10000)
                         print("login page loaded")
-                        self._inject_accept_button_script()
+                        await self._inject_accept_button_script()
                         print("injected accept button script (will click after 60s)")
                     except Exception as e:
                         print(f"wait for login page timeout: {e}")
-                    api_response = self._fill_email_and_submit()
+                    api_response = await self._fill_email_and_submit()
                         
                     if api_response:
                         if api_response["data"]["mobileConnectScreen"]["displayedAccount"]["isMobileConnect"] :
@@ -571,34 +557,50 @@ class OrangeChecker:
 
         return {"title": title, "url": current_url, "is_captcha": is_captcha,"is_mobile_connect":check_mobile_connect}
 
-    def run(self) -> dict[str, str | bool]:
-        self.setup_browser()
-        return self.check_page()
-
-    
+    async def run(self) -> dict[str, str | bool]:
+        await self.setup_context()
+        return await self.check_page()
 
 
 
-
-def check_mail(mail):
-    try:
-        with OrangeChecker(headless=False, email=mail.strip()) as checker:
-            result = checker.run()
-            print(f"{mail} -> {result}")
-            return result
-    except Exception as e:
-        print(f"{mail} -> error: {e}")
-        return None
-
-def main():
+async def main() -> None:
+    # Đọc mail  
     with open("html.txt") as f:
         mails = [m.strip() for m in f.readlines()]
 
+    async with Stealth().use_async(async_playwright()) as p:
+    # p: Playwright = await async_playwright().start()
+        browser_count = 3
 
-    workers = 6
+        browser: Browser = await p.chromium.launch(
+            channel="chromium", headless=False
+        )
 
-    with Pool(workers) as pool:
-        pool.map(check_mail, mails)
+        try:
+            context_list: list[OrangeChecker] = []
+            for idx in range(browser_count):
+                print(f"Đang tạo context {idx + 1}...")
+
+                ctx: BrowserContext = await browser.new_context()
+                print(ctx)
+                mail = mails[idx] if idx < len(mails) else None
+                ctx_wrapper = OrangeChecker(context=ctx, email=mail,)
+                context_list.append(ctx_wrapper)
+
+
+            for idx, ctx_wrapper in enumerate(context_list,1):
+                ctx_wrapper.run()
+
+            await asyncio.to_thread(input)
+
+        finally:
+            await browser.close()
+            await p.stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
+
+
+
+
