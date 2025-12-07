@@ -3,7 +3,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from urllib.parse import parse_qs, urlparse
-
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 import torch
 from PIL import Image
 from playwright.async_api import (
@@ -180,20 +180,28 @@ class OrangeChecker:
             return None
 
         try:
-            timeline_element = await self.page.locator(".ob1-timeline-step.active")
+            # KHÔNG ĐƯỢC await locator
+            timeline_element = self.page.locator(".ob1-timeline-step.active")
+
             await timeline_element.wait_for(state="attached", timeout=5000)
-            title_element = await timeline_element.locator(".ob1-timeline-title")
-            if title_element.count() > 0:
-                content = title_element.first.text_content()
+
+            title_element = timeline_element.locator(".ob1-timeline-title")
+
+            if await title_element.count() > 0:
+                content = await title_element.first.text_content()
                 if content:
                     return content.strip()
-            else:
-                content = timeline_element.text_content()
-                if content:
-                    return content.strip()
+
+            # fallback: đọc trực tiếp text trong step
+            content = await timeline_element.text_content()
+            if content:
+                return content.strip()
+
         except Exception:
             pass
+
         return None
+
 
     async def _has_active_step(self) -> bool:
         if not self.page:
@@ -220,8 +228,8 @@ class OrangeChecker:
 
         return image_data
 
-    def _screenshot_element(self, button_locator) -> str:
-        screenshot_bytes = button_locator.screenshot()
+    async def _screenshot_element(self, button_locator) -> str:
+        screenshot_bytes =await button_locator.screenshot()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             tmp.write(screenshot_bytes)
             return tmp.name
@@ -247,12 +255,11 @@ class OrangeChecker:
         if not self.page:
             return
 
-        await self._load_model()
+        self._load_model()
 
         items_to_process = [
             item for item in image_data if item["index"] not in self.image_cache
         ]
-
         if not items_to_process:
             return
 
@@ -260,6 +267,7 @@ class OrangeChecker:
         temp_files = []
 
         try:
+            # screenshot async
             for item in items_to_process:
                 try:
                     image_path = await self._screenshot_element(item["button"])
@@ -268,22 +276,20 @@ class OrangeChecker:
                 except Exception as e:
                     print(f"error screenshot image {item['index']}: {e}")
 
-            with ThreadPoolExecutor(max_workers=9) as executor:
-                futures = {
-                    executor.submit(
-                        self._process_single_image, image_paths[index], index
-                    ): index
-                    for index in image_paths.keys()
-                }
+            # chạy model bằng asyncio.to_thread
+            tasks = []
+            for index, path in image_paths.items():
+                tasks.append(
+                    asyncio.to_thread(self._process_single_image, path, index)
+                )
 
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result:
-                        index, class_name, confidence = result
-                        self.image_cache[index] = class_name
-                        print(
-                            f"image {index}: {class_name} (confidence: {confidence:.2f})"
-                        )
+            results = await asyncio.gather(*tasks)
+
+            for result in results:
+                if result:
+                    index, class_name, confidence = result
+                    self.image_cache[index] = class_name
+                    print(f"image {index}: {class_name} (confidence: {confidence:.2f})")
 
         finally:
             for tmp_file in temp_files:
@@ -291,6 +297,7 @@ class OrangeChecker:
                     os.unlink(tmp_file)
                 except Exception:
                     pass
+
 
     async def _solve_captcha_step(self, use_cache: bool = False) -> int:
         if not self.page:
@@ -311,7 +318,7 @@ class OrangeChecker:
         print(f"found {len(image_data)} captcha images")
 
         if not use_cache:
-            self._predict_and_cache_images(image_data)
+            await self._predict_and_cache_images(image_data)
 
         clicked_count = 0
 
@@ -322,7 +329,7 @@ class OrangeChecker:
 
             if class_name.lower() in requirement.lower():
                 button = item["button"]
-                button.click()
+                await button.click()
                 clicked_count += 1
                 print(f"clicked image {item['index']}")
 
@@ -330,7 +337,7 @@ class OrangeChecker:
 
         return clicked_count
 
-    def _reload_captcha_images(self) -> bool:
+    async def _reload_captcha_images(self) -> bool:
         if not self.page:
             return False
 
@@ -338,8 +345,8 @@ class OrangeChecker:
             reload_button = self.page.locator(".ob1-link-icon").filter(
                 has_text="Nouveau jeu d'images"
             )
-            reload_button.wait_for(state="visible", timeout=5000)
-            reload_button.click()
+            await reload_button.wait_for(state="visible", timeout=5000)
+            await reload_button.click()
             print("reloaded captcha images")
             return True
         except Exception as e:
@@ -356,7 +363,7 @@ class OrangeChecker:
         max_steps = 10
         max_reloads = 3
 
-        while self._has_active_step() and step_count < max_steps:
+        while await self._has_active_step() and step_count < max_steps:
             step_count += 1
             print(f"\n--- solving step {step_count} ---")
 
@@ -373,7 +380,7 @@ class OrangeChecker:
                 if reload_count < max_reloads - 1:
                     print("no matching images found, reloading...")
                     self.image_cache.clear()
-                    if self._reload_captcha_images():
+                    if await self._reload_captcha_images():
                         use_cache = False
                         reload_count += 1
                     else:
@@ -385,7 +392,7 @@ class OrangeChecker:
                 print("failed to solve step after reloads")
                 return False
 
-            if not self._has_active_step():
+            if not await self._has_active_step():
                 print("all steps completed")
                 return True
 
@@ -409,7 +416,7 @@ class OrangeChecker:
             print(f"không tìm thấy continue button: {e}")
             return False
 
-    def _inject_accept_button_script(self) -> None:
+    async def _inject_accept_button_script(self) -> None:
         if not self.page:
             return
 
@@ -453,7 +460,7 @@ class OrangeChecker:
             }, 60000);
         })();
         """
-        self.page.evaluate(accept_script)
+        await self.page.evaluate(accept_script)
 
     async def _fill_email_and_submit(self) -> dict | None:
         if not self.page:
@@ -474,128 +481,200 @@ class OrangeChecker:
             submit_button = self.page.locator("#btnSubmit")
             await submit_button.wait_for(state="visible", timeout=5000)
 
-            try:
-                with self.page.expect_response(
-                    lambda response: "orange.fr" in response.url
-                    and (
-                        "idme" in response.url.lower() or "api" in response.url.lower()
-                    ),
-                    timeout=15000,
-                ) as response_info:
-                    submit_button.click()
-                    print("clicked submit button")
+            # ĐÚNG CHUẨN → async context manager
+            async with self.page.expect_response(
+                lambda response: (
+                    "orange.fr" in response.url
+                    and ("idme" in response.url.lower()
+                         or "api" in response.url.lower())
+                ),
+                timeout=15000,
+            ) as response_info:
 
-                response = response_info.value
-                print(f"api response url: {response.url}")
-                print(f"api response status: {response.status}")
-
-                try:
-                    response_data = response.json()
-                    print(f"api response data: {response_data}")
-                    return response_data
-                except Exception:
-                    response_text = response.text()
-                    print(f"api response text: {response_text}")
-                    return {"text": response_text, "status": response.status}
-            except Exception as e:
-                print(f"no api response captured: {e}")
                 await submit_button.click()
                 print("clicked submit button")
-                return None
+
+            response = await response_info.value
+            print(f"api response url: {response.url}")
+            print(f"api response status: {response.status}")
+
+            try:
+                response_data = await response.json()
+                print(f"api response data: {response_data}")
+                return response_data
+            except Exception:
+                response_text = await response.text()
+                print(f"api response text: {response_text}")
+                return {
+                    "text": response_text,
+                    "status": response.status,
+                }
 
         except Exception as e:
-            print(f"error filling email: {e}")
+            print(f"no api response captured: {e}")
+            # fallback click
+            await submit_button.click()
+            print("clicked submit button (fallback)")
             return None
+
+
 
     async def check_page(self) -> dict[str, str | bool]:
         if not self.page:
             raise RuntimeError("page chưa được setup, gọi setup_browser() trước")
-
+    
         await self.page.goto("https://login.orange.fr", wait_until="load")
-
+    
+        # ----------- xác định captcha -----------
         try:
-            await self.page.wait_for_url(
-                self._is_captcha_url, timeout=5000, wait_until="networkidle"
+            await self.page.wait_for_function(
+                "() => location.hostname === 'captcha.orange.fr'",
+                timeout=5000,
             )
             is_captcha = True
-        except Exception:
-            is_captcha = False
-
+        except:
+            is_captcha = self._is_captcha_url(self.page.url)
+    
         current_url = self.page.url
-        if not is_captcha:
-            is_captcha = self._is_captcha_url(current_url)
-
+        check_mobile_connect = False
+    
+        # ----------- solve captcha -----------
         if is_captcha:
             print(f"captcha detected: {current_url}")
-            self.page.wait_for_selector("#image-grid", timeout=10000)
+            await self.page.wait_for_selector("#image-grid", timeout=10000)
+    
             solved = await self._solve_captcha()
-            check_mobile_connect= False
+    
             if solved:
-                if self._click_continue_button():
+                if await self._click_continue_button():
+                
+                    # chờ load login
                     try:
                         await self.page.wait_for_selector("#login", timeout=10000)
                         print("login page loaded")
                         await self._inject_accept_button_script()
-                        print("injected accept button script (will click after 60s)")
                     except Exception as e:
                         print(f"wait for login page timeout: {e}")
+    
+                    # ----------- gọi API email -----------
                     api_response = await self._fill_email_and_submit()
-                        
-                    if api_response:
-                        if api_response["data"]["mobileConnectScreen"]["displayedAccount"]["isMobileConnect"] :
+    
+                    # nếu submit rồi mà không có API response → exit để chạy context mới
+                    if not api_response:
+                        print("no API response -> exiting context early")
+                        return {"title": await self.page.title(),
+                                "url": current_url,
+                                "is_captcha": is_captcha,
+                                "is_mobile_connect": False}
+    
+                    # ------- kiểm tra mobile connect -------
+                    try:
+                        if (
+                            api_response.get("data", {})
+                            .get("mobileConnectScreen", {})
+                            .get("displayedAccount", {})
+                            .get("isMobileConnect")
+                        ):
                             check_mobile_connect = True
-                        print(f"captured api response: {api_response}")
-
-        
+                    except Exception as e:
+                        print("error checking mobile connect:", e)
+    
+        # ----------- lưu email nếu mobile connect ----------
         if check_mobile_connect:
-            save_mail =  self.email.strip()
             with open("mail_is_mobile.txt","a", encoding="utf-8") as f:
-                f.write(self.email.strip() + "\r\n")
-        title = self.page.title()
-        print(f"page title: {title}")
-        print(f"current url: {current_url}")
+                f.write(self.email.strip() + "\n")
+    
+        title = await self.page.title()
+    
+        return {
+            "title": title,
+            "url": current_url,
+            "is_captcha": is_captcha,
+            "is_mobile_connect": check_mobile_connect,
+        }
 
-        return {"title": title, "url": current_url, "is_captcha": is_captcha,"is_mobile_connect":check_mobile_connect}
 
-    async def run(self) -> dict[str, str | bool]:
-        await self.setup_context()
-        return await self.check_page()
+    async def run(self) -> dict[str, str | bool] | None:
+        try:
+            await self.setup_context()
+            return await self.check_page()
+
+        except PlaywrightTimeoutError as e:
+            print(f"Timeout detected: {e}")
+            print("Resetting context...")
+
+            # Đóng page và context cũ
+            try:
+                if self.page:
+                    await self.page.close()
+                    print("Closed old page")
+            except:
+                pass
+
+            try:
+                if self.context:
+                    await self.context.close()
+                    print("Closed old context")
+            except:
+                pass
+
+            # Tạo context mới
+            await self.setup_context()
+            print("Created new context")
+
+            # Chạy lại check_page
+            try:
+                return await self.check_page()
+            except Exception as e2:
+                print(f"Failed even after resetting context: {e2}")
+                return None
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            return None
 
 
 
-async def main() -> None:
-    # Đọc mail  
+async def worker(id: int, mails: list[str], p):
+    browser = await p.chromium.launch(channel="chromium", headless=False)
+
+    while mails:
+        email = mails.pop(0)
+        print(f"[CTX {id}] - Checking: {email}")
+
+        ctx = await browser.new_context()
+        bot = OrangeChecker(context=ctx, email=email)
+
+        try:
+            await bot.run()
+        except Exception as e:
+            print(f"[CTX {id}] ERROR: {e}")
+
+        # luôn đảm bảo đóng context để tránh leak
+        try:
+            await ctx.close()
+        except:
+            pass
+
+    print(f"[CTX {id}] Completed all mails.")
+    await browser.close()
+
+
+
+async def main():
     with open("html.txt") as f:
         mails = [m.strip() for m in f.readlines()]
 
+    browser_count = 3
+
     async with Stealth().use_async(async_playwright()) as p:
-    # p: Playwright = await async_playwright().start()
-        browser_count = 3
+        tasks = [
+            worker(i, mails, p)
+            for i in range(browser_count)
+        ]
 
-        browser: Browser = await p.chromium.launch(
-            channel="chromium", headless=False
-        )
+        await asyncio.gather(*tasks)
 
-        try:
-            context_list: list[OrangeChecker] = []
-            for idx in range(browser_count):
-                print(f"Đang tạo context {idx + 1}...")
-
-                ctx: BrowserContext = await browser.new_context()
-                print(ctx)
-                mail = mails[idx] if idx < len(mails) else None
-                ctx_wrapper = OrangeChecker(context=ctx, email=mail,)
-                context_list.append(ctx_wrapper)
-
-
-            for idx, ctx_wrapper in enumerate(context_list,1):
-                ctx_wrapper.run()
-
-            await asyncio.to_thread(input)
-
-        finally:
-            await browser.close()
-            await p.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
