@@ -3,13 +3,14 @@ from modules import BrowserHandler
 from modules.captcha_handler import CaptchaHandler
 
 async def main():
-    # Create CaptchaHandler instance once
     captcha_handler = CaptchaHandler(model_path="model.pth")
-
-    # Pass the handler to BrowserHandler
-    async with BrowserHandler(captcha_handler=captcha_handler) as b:
-        await b.check()
+    num_threads = 2
+    mails = []
+    with open("html.txt","r") as f:
+        mails= f.readlines()
+    async with BrowserHandler(captcha_handler=captcha_handler, numthread=num_threads,mails=mails) as b:
+        await b.check_all()
         await asyncio.to_thread(input)
 
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
