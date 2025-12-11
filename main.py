@@ -1,16 +1,26 @@
 import asyncio
-from modules import BrowserHandler
+from modules.requests_handler import check_mail
 from modules.captcha_handler import CaptchaHandler
 
-async def main():
-    captcha_handler = CaptchaHandler(model_path="model.pth")
-    num_threads = 2
-    mails = []
-    with open("html.txt","r") as f:
-        mails= f.readlines()
-    async with BrowserHandler(captcha_handler=captcha_handler, numthread=num_threads,mails=mails) as b:
-        await b.check_all()
-        await asyncio.to_thread(input)
+captcha_handler = CaptchaHandler(model_path="model.pth")
+num_threads = 2  # chạy tối đa 2 mail cùng lúc
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def worker(mail, captcha_handler, sem):
+    async with sem:                    # giới hạn số luồng
+        await check_mail(mail, captcha_handle=captcha_handler)
+
+async def main():
+    sem = asyncio.Semaphore(num_threads)
+
+    # đọc mail
+    with open("html.txt", "r") as f:
+        mails = [m.strip() for m in f.readlines()]
+
+    # tạo toàn bộ task
+    tasks = [worker(mail, captcha_handler, sem) for mail in mails]
+
+    # chạy song song theo limit
+    await asyncio.gather(*tasks)
+
+# chạy chương trình
+asyncio.run(main())
