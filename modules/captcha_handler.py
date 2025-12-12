@@ -1,4 +1,3 @@
-
 from io import BytesIO
 import torch
 from PIL import Image
@@ -64,9 +63,7 @@ class CaptchaHandler:
         with torch.no_grad():
             outputs = self.model(img_tensor)
             probs = torch.nn.functional.softmax(outputs, dim=1)
-            top_prob, top_idx = torch.max(probs, dim=1)
+            _, top_idx = torch.max(probs, dim=1)
         if self.class_names is not None:
             class_name = self.class_names[top_idx.item()]
-            confidence = top_prob.item()
-            print(class_name)
-            print(confidence)
+            return class_name
